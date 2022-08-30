@@ -15,7 +15,7 @@ import (
 	metrics "github.com/ChainSafe/chainbridge-utils/metrics/types"
 	"github.com/ChainSafe/chainbridge-utils/msg"
 	"github.com/ChainSafe/log15"
-	"https://github.com/centrifuge/go-substrate-rpc-client/tree/master/types"
+	"https://github.com/centrifuge/go-substrate-rpc-client/types"
 )
 
 type listener struct {
