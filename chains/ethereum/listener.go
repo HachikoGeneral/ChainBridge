@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ChainSafe/chainbridge/utils/msg"
+	"github.com/ChainSafe/chainbridge-utils/msg"
 	"math/big"
 	"time"
 
