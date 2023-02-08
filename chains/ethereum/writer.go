@@ -1,4 +1,4 @@
-// Copyright 2020 Stafi Protocol
+// Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: LGPL-3.0-only
 
 package ethereum
@@ -11,54 +11,37 @@ import (
 	"github.com/ChainSafe/log15"
 )
 
-const (
-	TransferredStatus uint8 = 2
-	CancelledStatus   uint8 = 3
+var _ core.Writer = &writer{}
 
-	msgLimit = 4096
-)
+// https://github.com/ChainSafe/chainbridge-solidity/blob/b5ed13d9798feb7c340e737a726dd415b8815366/contracts/Bridge.sol#L20
+var PassedStatus uint8 = 2
+var TransferredStatus uint8 = 3
+var CancelledStatus uint8 = 4
 
 type writer struct {
-	cfg            *ethconn.Config
+	cfg            Config
 	conn           Connection
 	bridgeContract *Bridge.Bridge // instance of bound receiver bridgeContract
 	log            log15.Logger
-	msgChan        chan msg.Message
 	stop           <-chan int
 	sysErr         chan<- error // Reports fatal error to core
+	metrics        *metrics.ChainMetrics
 }
 
 // NewWriter creates and returns writer
-func NewWriter(conn Connection, cfg *ethconn.Config, log log15.Logger, stop <-chan int, sysErr chan<- error) *writer {
+func NewWriter(conn Connection, cfg *Config, log log15.Logger, stop <-chan int, sysErr chan<- error, m *metrics.ChainMetrics) *writer {
 	return &writer{
-		cfg:     cfg,
+		cfg:     *cfg,
 		conn:    conn,
 		log:     log,
-		msgChan: make(chan msg.Message, msgLimit),
 		stop:    stop,
 		sysErr:  sysErr,
+		metrics: m,
 	}
 }
 
 func (w *writer) start() error {
 	w.log.Debug("Starting ethereum writer...")
-	go func() {
-		for {
-			select {
-			case <-w.stop:
-				close(w.msgChan)
-				w.log.Info("writer stopped")
-				return
-			case msg := <-w.msgChan:
-				result := w.processMessage(msg)
-				w.log.Info("processMessage", "result", result)
-				if !result {
-					w.sysErr <- fmt.Errorf("processMessage failed")
-				}
-			}
-		}
-	}()
-
 	return nil
 }
 
@@ -67,28 +50,18 @@ func (w *writer) setContract(bridge *Bridge.Bridge) {
 	w.bridgeContract = bridge
 }
 
-func (w *writer) ResolveMessage(m msg.Message) bool {
-	w.log.Info("Attempting to resolve message", "type", m.Type, "src", m.Source, "dst", m.Destination, "nonce", m.DepositNonce, "rId", m.ResourceId.Hex())
-	w.log.Info("ResolveMessage: size of msgChan", "size", len(w.msgChan))
-	w.msgChan <- m
-	return true
-}
-
 // ResolveMessage handles any given message based on type
 // A bool is returned to indicate failure/success, this should be ignored except for within tests.
-func (w *writer) processMessage(m msg.Message) bool {
-	w.log.Info("Attempting to process message", "type", m.Type, "src", m.Source, "dst", m.Destination, "nonce", m.DepositNonce, "rId", m.ResourceId.Hex())
+func (w *writer) ResolveMessage(m msg.Message) bool {
+	w.log.Info("Attempting to resolve message", "type", m.Type, "src", m.Source, "dst", m.Destination, "nonce", m.DepositNonce, "rId", m.ResourceId.Hex())
+
 	switch m.Type {
 	case msg.FungibleTransfer:
-		result := make(chan bool)
-		defer close(result)
-		go w.createErc20Proposal(m, result)
-		select {
-		case <-w.stop:
-			return false
-		case re := <-result:
-			return re
-		}
+		return w.createErc20Proposal(m)
+	case msg.NonFungibleTransfer:
+		return w.createErc721Proposal(m)
+	case msg.GenericTransfer:
+		return w.createGenericDepositProposal(m)
 	default:
 		w.log.Error("Unknown message type received", "type", m.Type)
 		return false

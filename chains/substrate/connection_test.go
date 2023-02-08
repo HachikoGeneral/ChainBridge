@@ -6,7 +6,7 @@ package substrate
 import (
 	"testing"
 
-	"github.com/centrifuge/go-substrate-rpc-client/tree/v4.0.0/types"
+	"github.com/centrifuge/go-substrate-rpc-client/types"
 )
 
 func TestConnect_QueryStorage(t *testing.T) {

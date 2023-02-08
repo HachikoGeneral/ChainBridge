@@ -1,14 +1,14 @@
-// Copyright 2020 Stafi Protocol
+// Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: LGPL-3.0-only
 /*
 The ethereum package contains the logic for interacting with ethereum chains.
 
-There are 3 major components: the ethconn, the listener, and the writer.
-The currently supported transfer types are Fungible (ERC20).
+There are 3 major components: the connection, the listener, and the writer.
+The currently supported transfer types are Fungible (ERC20), Non-Fungible (ERC721), and generic.
 
 Connection
 
-The ethconn contains the ethereum RPC client and can be accessed by both the writer and listener.
+The connection contains the ethereum RPC client and can be accessed by both the writer and listener.
 
 Listener
 
@@ -41,6 +41,10 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
+var _ core.Chain = &Chain{}
+
+var _ Connection = &connection.Connection{}
+
 type Connection interface {
 	Connect() error
 	Keypair() *secp256k1.Keypair
@@ -51,25 +55,47 @@ type Connection interface {
 	Client() *ethclient.Client
 	EnsureHasBytecode(address common.Address) error
 	LatestBlock() (*big.Int, error)
-	WaitForBlock(block *big.Int) error
+	WaitForBlock(block *big.Int, delay *big.Int) error
 	Close()
 }
 
 type Chain struct {
 	cfg      *core.ChainConfig // The config of the chain
-	conn     Connection        // THe chains ethconn
+	conn     Connection        // THe chains connection
 	listener *listener         // The listener of this chain
 	writer   *writer           // The writer of the chain
 	stop     chan<- int
 }
 
-func InitializeChain(chainCfg *core.ChainConfig, logger log15.Logger, sysErr chan<- error) (*Chain, error) {
-	cfg, err := ethconn.ParseChainConfig(chainCfg)
+// checkBlockstore queries the blockstore for the latest known block. If the latest block is
+// greater than cfg.startBlock, then cfg.startBlock is replaced with the latest known block.
+func setupBlockstore(cfg *Config, kp *secp256k1.Keypair) (*blockstore.Blockstore, error) {
+	bs, err := blockstore.NewBlockstore(cfg.blockstorePath, cfg.id, kp.Address())
 	if err != nil {
 		return nil, err
 	}
 
-	kpI, err := keystore.KeypairFromAddress(cfg.From(), keystore.EthChain, cfg.KeystorePath(), chainCfg.Insecure)
+	if !cfg.freshStart {
+		latestBlock, err := bs.TryLoadLatestBlock()
+		if err != nil {
+			return nil, err
+		}
+
+		if latestBlock.Cmp(cfg.startBlock) == 1 {
+			cfg.startBlock = latestBlock
+		}
+	}
+
+	return bs, nil
+}
+
+func InitializeChain(chainCfg *core.ChainConfig, logger log15.Logger, sysErr chan<- error, m *metrics.ChainMetrics) (*Chain, error) {
+	cfg, err := parseChainConfig(chainCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	kpI, err := keystore.KeypairFromAddress(cfg.from, keystore.EthChain, cfg.keystorePath, chainCfg.Insecure)
 	if err != nil {
 		return nil, err
 	}
@@ -81,13 +107,25 @@ func InitializeChain(chainCfg *core.ChainConfig, logger log15.Logger, sysErr cha
 	}
 
 	stop := make(chan int)
-	conn := ethconn.NewConnection(cfg, kp, logger)
+	conn := connection.NewConnection(cfg.endpoint, cfg.http, kp, logger, cfg.gasLimit, cfg.maxGasPrice, cfg.gasMultiplier)
 	err = conn.Connect()
 	if err != nil {
 		return nil, err
 	}
+	err = conn.EnsureHasBytecode(cfg.bridgeContract)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.EnsureHasBytecode(cfg.erc20HandlerContract)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.EnsureHasBytecode(cfg.genericHandlerContract)
+	if err != nil {
+		return nil, err
+	}
 
-	bridgeContract, err := bridge.NewBridge(cfg.BridgeContract(), conn.Client())
+	bridgeContract, err := bridge.NewBridge(cfg.bridgeContract, conn.Client())
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +139,17 @@ func InitializeChain(chainCfg *core.ChainConfig, logger log15.Logger, sysErr cha
 		return nil, fmt.Errorf("chainId (%d) and configuration chainId (%d) do not match", chainId, chainCfg.Id)
 	}
 
-	erc20HandlerContract, err := ERC20Handler.NewERC20Handler(cfg.Erc20HandlerContract(), conn.Client())
+	erc20HandlerContract, err := erc20Handler.NewERC20Handler(cfg.erc20HandlerContract, conn.Client())
+	if err != nil {
+		return nil, err
+	}
+
+	erc721HandlerContract, err := erc721Handler.NewERC721Handler(cfg.erc721HandlerContract, conn.Client())
+	if err != nil {
+		return nil, err
+	}
+
+	genericHandlerContract, err := GenericHandler.NewGenericHandler(cfg.genericHandlerContract, conn.Client())
 	if err != nil {
 		return nil, err
 	}
@@ -111,13 +159,13 @@ func InitializeChain(chainCfg *core.ChainConfig, logger log15.Logger, sysErr cha
 		if err != nil {
 			return nil, err
 		}
-		cfg.SetStartBlock(curr)
+		cfg.startBlock = curr
 	}
 
-	listener := NewListener(conn, cfg, logger, bs, stop, sysErr)
-	listener.setContracts(bridgeContract, erc20HandlerContract)
+	listener := NewListener(conn, cfg, logger, bs, stop, sysErr, m)
+	listener.setContracts(bridgeContract, erc20HandlerContract, erc721HandlerContract, genericHandlerContract)
 
-	writer := NewWriter(conn, cfg, logger, stop, sysErr)
+	writer := NewWriter(conn, cfg, logger, stop, sysErr, m)
 	writer.setContract(bridgeContract)
 
 	return &Chain{
@@ -157,32 +205,14 @@ func (c *Chain) Name() string {
 	return c.cfg.Name
 }
 
+func (c *Chain) LatestBlock() metrics.LatestBlock {
+	return c.listener.latestBlock
+}
+
 // Stop signals to any running routines to exit
 func (c *Chain) Stop() {
 	close(c.stop)
 	if c.conn != nil {
 		c.conn.Close()
 	}
-}
-
-// checkBlockstore queries the blockstore for the latest known block. If the latest block is
-// greater than cfg.startBlock, then cfg.startBlock is replaced with the latest known block.
-func setupBlockstore(cfg *ethconn.Config, kp *secp256k1.Keypair) (*blockstore.Blockstore, error) {
-	bs, err := blockstore.NewBlockstore(cfg.BlockstorePath(), cfg.ChainId(), kp.Address())
-	if err != nil {
-		return nil, err
-	}
-
-	if !cfg.FreshStart() {
-		latestBlock, err := bs.TryLoadLatestBlock()
-		if err != nil {
-			return nil, err
-		}
-
-		if latestBlock.Cmp(cfg.StartBlock()) == 1 {
-			cfg.SetStartBlock(latestBlock)
-		}
-	}
-
-	return bs, nil
 }
