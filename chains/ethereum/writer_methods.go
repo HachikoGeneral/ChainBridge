@@ -8,10 +8,9 @@ import (
 	"math/big"
 	"time"
 
-	eth "github.com/ethereum/go-ethereum"
-	ethcommon "github.com/ethereum/go-ethereum/common"
-	utils "github.com/stafiprotocol/chainbridge/shared/ethereum"
-	"github.com/stafiprotocol/chainbridge/utils/msg"
+	utils "github.com/ChainSafe/ChainBridge/shared/ethereum"
+	"github.com/ChainSafe/chainbridge-utils/msg"
+	log "github.com/ChainSafe/log15"
 )
 
 // Time between retrying a failed tx
